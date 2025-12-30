@@ -13,6 +13,9 @@
 #   --token SECRET    Authentication token for connections
 #   --contexts N      Number of parallel contexts (default: 2)
 #   --info-level LVL  Log level: info|debug (default: info)
+#   --max-upload-size MB     Max upload size in MB (default: 25)
+#   --max-audio-duration MS  Max batch duration in ms (default: 300000)
+#   --batch-timeout MS       Context wait timeout in ms (default: 10000)
 #
 
 set -e
@@ -31,6 +34,9 @@ HOST="0.0.0.0"
 TOKEN=""
 CONTEXTS="2"
 INFO_LEVEL="info"
+MAX_UPLOAD_SIZE=""
+MAX_AUDIO_DURATION=""
+BATCH_TIMEOUT=""
 
 # Installation paths
 INSTALL_BIN="/usr/local/bin"
@@ -67,6 +73,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         --info-level)
             INFO_LEVEL="$2"
+            shift 2
+            ;;
+        --max-upload-size)
+            MAX_UPLOAD_SIZE="$2"
+            shift 2
+            ;;
+        --max-audio-duration)
+            MAX_AUDIO_DURATION="$2"
+            shift 2
+            ;;
+        --batch-timeout)
+            BATCH_TIMEOUT="$2"
             shift 2
             ;;
         *)
@@ -184,6 +202,24 @@ if [[ -n "$TOKEN" ]]; then
     PROGRAM_ARGS="$PROGRAM_ARGS
         <string>--token</string>
         <string>${TOKEN}</string>"
+fi
+
+if [[ -n "$MAX_UPLOAD_SIZE" ]]; then
+    PROGRAM_ARGS="$PROGRAM_ARGS
+        <string>--max-upload-size</string>
+        <string>${MAX_UPLOAD_SIZE}</string>"
+fi
+
+if [[ -n "$MAX_AUDIO_DURATION" ]]; then
+    PROGRAM_ARGS="$PROGRAM_ARGS
+        <string>--max-audio-duration</string>
+        <string>${MAX_AUDIO_DURATION}</string>"
+fi
+
+if [[ -n "$BATCH_TIMEOUT" ]]; then
+    PROGRAM_ARGS="$PROGRAM_ARGS
+        <string>--batch-timeout</string>
+        <string>${BATCH_TIMEOUT}</string>"
 fi
 
 # Generate plist with custom settings
