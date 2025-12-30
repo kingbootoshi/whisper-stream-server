@@ -5,6 +5,7 @@ Real-time speech-to-text transcription server using [whisper.cpp](https://github
 ## Features
 
 - **Real-time streaming transcription** via WebSocket
+- **Batch transcription** via HTTP WAV upload (`POST /v1/transcribe`)
 - **Voice Activity Detection (VAD)** - automatically detects speech end and emits final transcripts
 - **Metal GPU acceleration** on Apple Silicon (M1/M2/M3/M4)
 - **Multi-client support** with context pooling (configurable parallel sessions)
@@ -113,6 +114,14 @@ local-mac-audio-transcription/
 | `--vad-silence` | `1000` | Silence duration to trigger final (ms) |
 | `--language` | `en` | Language code |
 | `--no-gpu` | - | Disable Metal GPU |
+| `--max-upload-size` | `25` | Max batch upload size in MB |
+| `--max-audio-duration` | `300000` | Max batch duration in ms |
+| `--batch-timeout` | `10000` | Batch context wait timeout (ms) |
+
+### Logging
+
+Set `INFO_LEVEL=debug` to enable verbose logs (batch inference timing, resample info).
+Default is `info`, but `./scripts/run.sh` sets `INFO_LEVEL=debug` unless overridden.
 
 ## WebSocket Protocol
 

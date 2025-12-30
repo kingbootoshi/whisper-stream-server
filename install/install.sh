@@ -12,6 +12,7 @@
 #   --host ADDRESS    Bind address (default: 0.0.0.0)
 #   --token SECRET    Authentication token for connections
 #   --contexts N      Number of parallel contexts (default: 2)
+#   --info-level LVL  Log level: info|debug (default: info)
 #
 
 set -e
@@ -29,6 +30,7 @@ PORT="9090"
 HOST="0.0.0.0"
 TOKEN=""
 CONTEXTS="2"
+INFO_LEVEL="info"
 
 # Installation paths
 INSTALL_BIN="/usr/local/bin"
@@ -61,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --contexts)
             CONTEXTS="$2"
+            shift 2
+            ;;
+        --info-level)
+            INFO_LEVEL="$2"
             shift 2
             ;;
         *)
@@ -219,6 +225,8 @@ $PROGRAM_ARGS
     <dict>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin</string>
+        <key>INFO_LEVEL</key>
+        <string>${INFO_LEVEL}</string>
     </dict>
 
     <key>Nice</key>

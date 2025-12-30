@@ -72,6 +72,91 @@ ws.onclose = () => {
 };
 ```
 
+## HTTP Batch Transcription
+
+### Endpoint
+
+```
+POST http://localhost:9090/v1/transcribe
+```
+
+### Authentication
+
+If the server is started with `--token SECRET`, all HTTP batch requests must include:
+
+```
+Authorization: Bearer SECRET
+```
+
+### Request
+
+Headers:
+```
+Content-Type: audio/wav
+Authorization: Bearer <token>   (required if --token is set)
+```
+
+Body:
+- Raw WAV bytes (PCM16 mono). Any sample rate is accepted; the server resamples to 16kHz.
+
+### Response (200)
+
+```json
+{
+  "text": "And so my fellow Americans, ask not what your country can do for you.",
+  "duration_ms": 11234,
+  "processing_ms": 847,
+  "words": [
+    {"word": "And", "start_ms": 120, "end_ms": 280, "probability": 0.98}
+  ]
+}
+```
+
+### Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | string | Full transcript |
+| `duration_ms` | number | Audio duration after resampling |
+| `processing_ms` | number | Server-side processing time |
+| `words` | array | Word timings (10ms resolution) |
+| `words[].word` | string | Word text |
+| `words[].start_ms` | number | Word start in ms |
+| `words[].end_ms` | number | Word end in ms |
+| `words[].probability` | number | Geometric mean of token probs |
+
+### Error Responses
+
+| Status | Meaning | Notes |
+|--------|---------|-------|
+| 401 | Unauthorized | Missing/invalid bearer token |
+| 413 | Payload Too Large | Exceeds `--max-upload-size` |
+| 415 | Unsupported Media Type | Content-Type must be `audio/wav` |
+| 422 | Unprocessable Entity | Invalid WAV or duration too long |
+| 503 | Service Unavailable | No context available before timeout |
+
+### Limits and Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-upload-size` | 25 | Max upload size in MB |
+| `--max-audio-duration` | 300000 | Max duration in ms |
+| `--batch-timeout` | 10000 | Context wait timeout in ms |
+
+### Logging
+
+Batch requests log a short summary at info level. Set `INFO_LEVEL=debug` for verbose logs
+including resampling and inference timing.
+
+### Example (curl)
+
+```bash
+curl -X POST http://localhost:9090/v1/transcribe \
+  -H "Content-Type: audio/wav" \
+  -H "Authorization: Bearer YOUR_SECRET" \
+  --data-binary @recording.wav
+```
+
 ## Message Protocol
 
 ### Direction: Server → Client

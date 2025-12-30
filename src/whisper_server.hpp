@@ -39,6 +39,23 @@ struct ServerConfig {
 
     // Authentication
     std::string auth_token = "";        // Empty = no auth required
+
+    // Batch transcription (HTTP upload) limits
+    size_t max_upload_size_bytes = 25 * 1024 * 1024; // default: 25MB
+    int max_audio_duration_ms = 300000;              // default: 5 minutes
+    int batch_timeout_ms = 10000;                    // default: 10s
+};
+
+struct BatchWordTiming {
+    std::string word;
+    int start_ms = 0;
+    int end_ms = 0;
+    float probability = 0.0f;
+};
+
+struct BatchTranscribeResponse {
+    int status = 200;
+    std::string body_json;
 };
 
 // Forward declarations
@@ -137,11 +154,13 @@ public:
     std::string makePartialMessage(const std::string& text);
     std::string makeFinalMessage(const std::string& text);
     std::string makeErrorMessage(const std::string& error);
+    BatchTranscribeResponse transcribeWavBytes(const std::vector<uint8_t>& wav_bytes);
 
 private:
     ServerConfig config_;
     std::vector<std::unique_ptr<ContextSlot>> context_pool_;  // Use unique_ptr
     std::mutex context_pool_mutex_;  // Protect context pool access
+    std::condition_variable context_pool_cv_;
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
     std::mutex sessions_mutex_;
 
@@ -157,6 +176,7 @@ private:
 
     // Context pool management
     ContextSlot* acquireContext();
+    ContextSlot* acquireContextWithTimeout(int timeout_ms);
     void releaseContext(ContextSlot* slot);
 
     // Inference loop

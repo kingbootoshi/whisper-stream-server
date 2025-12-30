@@ -6,6 +6,9 @@ BUILD_DIR="$SERVER_DIR/build"
 BINARY="$BUILD_DIR/whisper-stream-server"
 MODELS_DIR="$SERVER_DIR/models"
 
+INFO_LEVEL="${INFO_LEVEL:-debug}"
+export INFO_LEVEL
+
 # Default model paths
 DEFAULT_MODEL="$MODELS_DIR/ggml-base.en.bin"
 DEFAULT_VAD_MODEL="$MODELS_DIR/ggml-silero-vad.bin"

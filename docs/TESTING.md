@@ -50,6 +50,7 @@ tests/
 │   │   ├── WavLoader.ts           # WAV file loading
 │   │   └── TestClient.ts          # WebSocket client
 │   └── tests/
+│       ├── batch-transcribe.test.ts
 │       ├── connection.test.ts
 │       ├── streaming.test.ts
 │       └── vad-boundaries.test.ts
@@ -159,6 +160,16 @@ Tests voice activity detection and final transcript emission.
 | `multiple utterances` | Each utterance gets a final |
 
 **Why it matters**: Tests the full VAD-gated pipeline. Catches bugs like empty finals.
+
+### Batch Transcribe (`batch-transcribe.test.ts`)
+
+Tests the HTTP batch transcription endpoint.
+
+| Test | What It Validates |
+|------|-------------------|
+| `returns text + word timestamps for JFK WAV` | JSON shape + word timing sanity |
+
+**Why it matters**: Validates WAV upload path, context pool use, and word timestamp output.
 
 ## Test Fixtures
 

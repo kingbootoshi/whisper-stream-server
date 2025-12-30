@@ -1,11 +1,22 @@
 #include "whisper_server.hpp"
+#include "json.hpp"
+#include "logging.hpp"
 
 #include <App.h>  // uWebSockets
 
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <csignal>
 #include <cstring>
+#include <memory>
+#include <atomic>
+#include <vector>
+#include <thread>
+#include <cstdlib>
+#include <cerrno>
+
+using json = nlohmann::json;
 
 // Global pointers for signal handling
 static WhisperServer* g_server = nullptr;
@@ -50,6 +61,9 @@ void printUsage(const char* prog) {
               << "      --translate       Translate to English\n"
               << "      --vad-threshold N Speech probability threshold 0.0-1.0 (default: 0.5)\n"
               << "      --vad-silence MS  Silence duration to trigger final (default: 1000)\n"
+              << "      --max-upload-size MB     Max upload size in MB (default: 25)\n"
+              << "      --max-audio-duration MS  Max audio duration in ms (default: 300000)\n"
+              << "      --batch-timeout MS       Context acquire timeout for batch (default: 10000)\n"
               << "  -h, --help            Show this help\n"
               << std::endl;
 }
@@ -107,6 +121,20 @@ bool parseArgs(int argc, char** argv, ServerConfig& config) {
         else if (arg == "--token" && i + 1 < argc) {
             config.auth_token = argv[++i];
         }
+        else if (arg == "--max-upload-size" && i + 1 < argc) {
+            int mb = std::stoi(argv[++i]);
+            if (mb <= 0) {
+                std::cerr << "Invalid --max-upload-size (must be > 0)\n";
+                return false;
+            }
+            config.max_upload_size_bytes = (size_t)mb * 1024ull * 1024ull;
+        }
+        else if (arg == "--max-audio-duration" && i + 1 < argc) {
+            config.max_audio_duration_ms = std::stoi(argv[++i]);
+        }
+        else if (arg == "--batch-timeout" && i + 1 < argc) {
+            config.batch_timeout_ms = std::stoi(argv[++i]);
+        }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage(argv[0]);
@@ -133,6 +161,37 @@ std::string getQueryParam(std::string_view query, const std::string& param) {
     size_t end = query.find('&', pos);
     if (end == std::string_view::npos) end = query.length();
     return std::string(query.substr(pos, end - pos));
+}
+
+static bool parseContentLength(std::string_view value, unsigned long long& out) {
+    if (value.empty()) return false;
+    std::string tmp(value);
+    char* end = nullptr;
+    errno = 0;
+    unsigned long long v = std::strtoull(tmp.c_str(), &end, 10);
+    if (errno != 0 || end == tmp.c_str() || *end != '\0') {
+        return false;
+    }
+    out = v;
+    return true;
+}
+
+static const char* httpStatusLine(int code) {
+    switch (code) {
+        case 200: return "200 OK";
+        case 401: return "401 Unauthorized";
+        case 413: return "413 Payload Too Large";
+        case 415: return "415 Unsupported Media Type";
+        case 422: return "422 Unprocessable Entity";
+        case 503: return "503 Service Unavailable";
+        default:  return "500 Internal Server Error";
+    }
+}
+
+static void endJson(uWS::HttpResponse<false>* res, int status, const json& body) {
+    res->writeStatus(httpStatusLine(status));
+    res->writeHeader("content-type", "application/json");
+    res->end(body.dump());
 }
 
 // Per-socket user data
@@ -164,7 +223,103 @@ int main(int argc, char** argv) {
     server.run();
 
     // Create uWebSockets app
-    uWS::App()
+    uWS::App app;
+
+    app.post("/v1/transcribe", [&server, &config](auto* res, auto* req) {
+        if (!config.auth_token.empty()) {
+            std::string_view auth = req->getHeader("authorization");
+            std::string expected = "Bearer " + config.auth_token;
+            if (auth != expected) {
+                json j;
+                j["error"] = "Unauthorized";
+                j["message"] = "Missing/invalid Authorization header";
+                endJson(res, 401, j);
+                return;
+            }
+        }
+
+        std::string_view ct = req->getHeader("content-type");
+        bool ct_ok =
+            ct.rfind("audio/wav", 0) == 0 ||
+            ct.rfind("audio/wave", 0) == 0 ||
+            ct.rfind("audio/x-wav", 0) == 0;
+
+        if (!ct_ok) {
+            json j;
+            j["error"] = "Unsupported Media Type";
+            j["message"] = "Content-Type must be audio/wav";
+            endJson(res, 415, j);
+            return;
+        }
+
+        std::string_view cl = req->getHeader("content-length");
+        unsigned long long content_len = 0;
+        if (parseContentLength(cl, content_len)) {
+            if (content_len > (unsigned long long)config.max_upload_size_bytes) {
+                json j;
+                j["error"] = "Payload Too Large";
+                j["message"] = "Upload exceeds max_upload_size";
+                endJson(res, 413, j);
+                return;
+            }
+        }
+
+        struct UploadState {
+            std::vector<uint8_t> body;
+            std::atomic<bool> aborted{false};
+            std::atomic<bool> responded{false};
+            std::atomic<bool> started{false};
+            uWS::HttpResponse<false>* res = nullptr;
+            uWS::Loop* loop = nullptr;
+        };
+
+        auto state = std::make_shared<UploadState>();
+        state->res = res;
+        state->loop = uWS::Loop::get();
+
+        res->onAborted([state]() {
+            state->aborted.store(true);
+        });
+
+        res->onData([state, &server, &config](std::string_view chunk, bool isLast) {
+            if (state->aborted.load() || state->responded.load()) return;
+
+            if (state->body.size() + chunk.size() > config.max_upload_size_bytes) {
+                if (!state->responded.exchange(true)) {
+                    json j;
+                    j["error"] = "Payload Too Large";
+                    j["message"] = "Upload exceeds max_upload_size";
+                    endJson(state->res, 413, j);
+                }
+                return;
+            }
+
+            state->body.insert(state->body.end(), chunk.begin(), chunk.end());
+
+            if (!isLast) return;
+            if (state->started.exchange(true)) return;
+
+            std::vector<uint8_t> bytes;
+            bytes.swap(state->body);
+
+            std::thread([state, bytes = std::move(bytes), &server]() mutable {
+                logDebug("Batch upload complete: bytes=" + std::to_string(bytes.size()));
+                BatchTranscribeResponse r = server.transcribeWavBytes(bytes);
+
+                if (state->aborted.load()) return;
+
+                state->loop->defer([state, r = std::move(r)]() mutable {
+                    if (state->aborted.load() || state->responded.load()) return;
+                    state->responded.store(true);
+                    state->res->writeStatus(httpStatusLine(r.status));
+                    state->res->writeHeader("content-type", "application/json");
+                    state->res->end(r.body_json);
+                });
+            }).detach();
+        });
+    });
+
+    app
         .ws<PerSocketData>("/*", {
             // Settings
             .compression = uWS::DISABLED,

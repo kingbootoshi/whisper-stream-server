@@ -1,5 +1,7 @@
 #include "whisper_server.hpp"
 #include "json.hpp"
+#include "wav_utils.hpp"
+#include "logging.hpp"
 
 #include <App.h>  // For uWS::Loop and WebSocket types
 
@@ -8,6 +10,8 @@
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <cmath>
+#include <cctype>
 
 using json = nlohmann::json;
 
@@ -160,7 +164,290 @@ void WhisperServer::releaseContext(ContextSlot* slot) {
         std::lock_guard<std::mutex> lock(context_pool_mutex_);
         std::cout << "[whisper-server] Released context slot " << slot->slot_id << std::endl;
         slot->in_use = false;
+        context_pool_cv_.notify_one();
     }
+}
+
+ContextSlot* WhisperServer::acquireContextWithTimeout(int timeout_ms) {
+    using namespace std::chrono;
+
+    std::unique_lock<std::mutex> lock(context_pool_mutex_);
+    auto try_acquire = [&]() -> ContextSlot* {
+        for (auto& slot : context_pool_) {
+            if (!slot->in_use) {
+                slot->in_use = true;
+                std::cout << "[whisper-server] Acquired context slot " << slot->slot_id
+                          << " (batch)" << std::endl;
+                return slot.get();
+            }
+        }
+        return nullptr;
+    };
+
+    if (ContextSlot* slot = try_acquire()) {
+        return slot;
+    }
+
+    if (timeout_ms <= 0) {
+        return nullptr;
+    }
+
+    const auto deadline = steady_clock::now() + milliseconds(timeout_ms);
+    while (steady_clock::now() < deadline) {
+        if (context_pool_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            break;
+        }
+        if (ContextSlot* slot = try_acquire()) {
+            return slot;
+        }
+    }
+
+    return nullptr;
+}
+
+static void trim_in_place(std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r");
+    size_t end = s.find_last_not_of(" \t\n\r");
+    if (start == std::string::npos || end == std::string::npos) {
+        s.clear();
+        return;
+    }
+    s = s.substr(start, end - start + 1);
+}
+
+static void ltrim_in_place(std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) {
+        s.clear();
+        return;
+    }
+    if (start > 0) s.erase(0, start);
+}
+
+static bool is_special_token_text(const std::string& s) {
+    std::string t = s;
+    trim_in_place(t);
+    if (t.size() >= 4 && t.rfind("[_", 0) == 0 && t.back() == ']') {
+        return true;
+    }
+    if (t.size() >= 4 && t.rfind("<|", 0) == 0 && t.back() == '>') {
+        return true;
+    }
+    return false;
+}
+
+static bool is_punct_only_ascii(const std::string& s) {
+    bool any = false;
+    for (unsigned char c : s) {
+        if (std::isspace(c)) continue;
+        any = true;
+        if (std::isalnum(c)) return false;
+    }
+    return any;
+}
+
+static BatchTranscribeResponse json_error(int status, const std::string& message) {
+    json j;
+    j["error"] = message;
+    BatchTranscribeResponse r;
+    r.status = status;
+    r.body_json = j.dump();
+    return r;
+}
+
+BatchTranscribeResponse WhisperServer::transcribeWavBytes(const std::vector<uint8_t>& wav_bytes) {
+    using namespace std::chrono;
+    const auto t0 = steady_clock::now();
+
+    WavPcm16Mono wav;
+    std::string wav_err;
+    if (!parse_wav_pcm16_mono_from_bytes(wav_bytes.data(), wav_bytes.size(), wav, wav_err)) {
+        logInfo("Batch request rejected: " + wav_err);
+        return json_error(422, "Invalid WAV: " + wav_err);
+    }
+
+    const int64_t in_duration_ms =
+        (int64_t)wav.samples.size() * 1000LL / (int64_t)wav.sample_rate;
+    logInfo(
+        "Batch request: bytes=" + std::to_string(wav_bytes.size()) +
+        " sample_rate=" + std::to_string(wav.sample_rate) +
+        " duration_ms=" + std::to_string(in_duration_ms)
+    );
+    if (in_duration_ms > config_.max_audio_duration_ms) {
+        logInfo(
+            "Batch request rejected: duration_ms=" + std::to_string(in_duration_ms) +
+            " max_ms=" + std::to_string(config_.max_audio_duration_ms)
+        );
+        return json_error(
+            422,
+            "Audio too long: " + std::to_string(in_duration_ms) +
+            "ms > max " + std::to_string(config_.max_audio_duration_ms) + "ms"
+        );
+    }
+
+    std::vector<float> pcm = wav.samples;
+    if (wav.sample_rate != WHISPER_SAMPLE_RATE) {
+        logDebug(
+            "Resampling from " + std::to_string(wav.sample_rate) +
+            " to " + std::to_string(WHISPER_SAMPLE_RATE)
+        );
+        pcm = resample_linear(pcm, wav.sample_rate, WHISPER_SAMPLE_RATE);
+    }
+
+    const int duration_ms =
+        (int)((int64_t)pcm.size() * 1000LL / (int64_t)WHISPER_SAMPLE_RATE);
+
+    ContextSlot* slot = acquireContextWithTimeout(config_.batch_timeout_ms);
+    if (!slot || !slot->ctx) {
+        logInfo("Batch request rejected: no available contexts");
+        return json_error(503, "No available contexts (batch timeout)");
+    }
+
+    struct Guard {
+        WhisperServer* server;
+        ContextSlot* slot;
+        ~Guard() { server->releaseContext(slot); }
+    } guard{this, slot};
+
+    whisper_context* ctx = slot->ctx;
+
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_progress = false;
+    wparams.print_special = false;
+    wparams.print_realtime = false;
+    wparams.print_timestamps = false;
+    wparams.translate = config_.translate;
+    wparams.language = config_.language.c_str();
+    wparams.n_threads = config_.n_threads;
+    wparams.no_context = true;
+    wparams.no_timestamps = false;
+    wparams.token_timestamps = true;
+    wparams.single_segment = false;
+    wparams.max_tokens = 0;
+
+    logDebug(
+        "Batch inference start: samples=" + std::to_string(pcm.size()) +
+        " threads=" + std::to_string(config_.n_threads)
+    );
+    if (whisper_full(ctx, wparams, pcm.data(), (int)pcm.size()) != 0) {
+        logInfo("Batch request failed: whisper_full returned error");
+        return json_error(500, "Whisper inference failed");
+    }
+
+    std::string text;
+    const int n_segments = whisper_full_n_segments(ctx);
+    for (int i = 0; i < n_segments; ++i) {
+        const char* segment_text = whisper_full_get_segment_text(ctx, i);
+        if (segment_text) text += segment_text;
+    }
+    trim_in_place(text);
+
+    std::vector<BatchWordTiming> words;
+    struct WordBuilder {
+        std::string w;
+        int start_ms = 0;
+        int end_ms = 0;
+        double log_prob_sum = 0.0;
+        int n = 0;
+    } cur;
+
+    auto emit = [&]() {
+        if (cur.n <= 0) return;
+        std::string outw = cur.w;
+        trim_in_place(outw);
+        if (!outw.empty()) {
+            const double prob = std::exp(cur.log_prob_sum / (double)cur.n);
+            BatchWordTiming wt;
+            wt.word = outw;
+            wt.start_ms = cur.start_ms;
+            wt.end_ms = cur.end_ms;
+            wt.probability = (float)prob;
+            words.push_back(std::move(wt));
+        }
+        cur = WordBuilder{};
+    };
+
+    for (int s = 0; s < n_segments; ++s) {
+        const int n_tokens = whisper_full_n_tokens(ctx, s);
+        for (int t = 0; t < n_tokens; ++t) {
+            const char* tok_c = whisper_full_get_token_text(ctx, s, t);
+            if (!tok_c) continue;
+            std::string tok(tok_c);
+            if (tok.empty()) continue;
+
+            whisper_token_data td = whisper_full_get_token_data(ctx, s, t);
+            const int t0_ms = td.t0 * 10;
+            const int t1_ms = td.t1 * 10;
+
+            float p = td.p;
+            if (p <= 0.0f) p = 1e-6f;
+            if (p > 1.0f) p = 1.0f;
+
+            const bool starts_ws = std::isspace((unsigned char)tok[0]) != 0;
+            std::string tok_trim = tok;
+            ltrim_in_place(tok_trim);
+            if (tok_trim.empty() || is_special_token_text(tok_trim)) {
+                continue;
+            }
+            const bool punct_only = is_punct_only_ascii(tok_trim);
+
+            if (cur.n == 0) {
+                cur.w = tok_trim;
+                cur.start_ms = t0_ms;
+                cur.end_ms = t1_ms;
+                cur.log_prob_sum = std::log((double)p);
+                cur.n = 1;
+                continue;
+            }
+
+            if (starts_ws && !tok_trim.empty() && !punct_only) {
+                emit();
+                cur.w = tok_trim;
+                cur.start_ms = t0_ms;
+                cur.end_ms = t1_ms;
+                cur.log_prob_sum = std::log((double)p);
+                cur.n = 1;
+            } else {
+                if (!tok_trim.empty()) {
+                    cur.w += tok_trim;
+                    cur.end_ms = t1_ms;
+                    cur.log_prob_sum += std::log((double)p);
+                    cur.n += 1;
+                }
+            }
+        }
+    }
+    emit();
+
+    const auto t1 = steady_clock::now();
+    const int processing_ms = (int)duration_cast<milliseconds>(t1 - t0).count();
+
+    json out;
+    out["text"] = text;
+    out["duration_ms"] = duration_ms;
+    out["processing_ms"] = processing_ms;
+    out["words"] = json::array();
+
+    for (const auto& w : words) {
+        out["words"].push_back({
+            {"word", w.word},
+            {"start_ms", w.start_ms},
+            {"end_ms", w.end_ms},
+            {"probability", w.probability}
+        });
+    }
+
+    logInfo(
+        "Batch request complete: duration_ms=" + std::to_string(duration_ms) +
+        " processing_ms=" + std::to_string(processing_ms) +
+        " words=" + std::to_string(words.size()) +
+        " text_chars=" + std::to_string(text.size())
+    );
+
+    BatchTranscribeResponse resp;
+    resp.status = 200;
+    resp.body_json = out.dump();
+    return resp;
 }
 
 std::shared_ptr<Session> WhisperServer::createSession(const std::string& id) {
