@@ -4,12 +4,13 @@
   "description": "Browser client for whisper-stream-server",
   "type": "module",
   "scripts": {
+    "check:deps": "node ../../scripts/check-exact-deps.mjs ../..",
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm run check:deps && tsc && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
-    "typescript": "^5.3.3",
-    "vite": "^5.0.10"
+    "typescript": "5.9.3",
+    "vite": "5.4.21"
   }
 }
